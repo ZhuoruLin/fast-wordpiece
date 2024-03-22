@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use tokenizers::{decoders::wordpiece, models::wordpiece::{WordPieceBuilder, WordPieceTrainer}, tokenizer::{Model, Result, Token}};
+use tokenizers::{models::wordpiece::{WordPieceBuilder, WordPieceTrainer}, tokenizer::{Model, Result, Token}};
 use tokenizers::models::wordpiece::Error;
 pub mod trie;
 pub mod trainer;
@@ -7,7 +7,6 @@ pub mod trainer;
 use trie::Trie;
 
 type Vocab = HashMap<String, u32>;
-type VocabR = HashMap<u32, String>;
 
 struct Config {
     files: Option<String>,
@@ -131,6 +130,16 @@ impl Model for Trie{
                 offsets: (0, sequence.len()),
             }]);
         }
+        // For exact match case
+        if let Some(vocab_id) = self.wordpiece.token_to_id(sequence){
+            return Ok(vec![
+                Token{
+                    id: vocab_id,
+                    value: sequence.to_string(),
+                    offsets: (0, char_len)
+                }
+            ])
+        }
         // Algorithm 1
         let (token_node_ids, u, i) = self.match_loop(sequence, 0);
         if (i < char_len) | (u!=self.get_suffix_id()){
@@ -173,6 +182,7 @@ pub mod test_trie{
         vocab.insert("##c".to_string(), 3);
         vocab.insert("##cdy".to_string(), 4);
         vocab.insert("##dz".to_string(), 5);
+        vocab.insert("[UNK]".to_string(), 6);
         vocab
     }
 
@@ -185,9 +195,8 @@ pub mod test_trie{
             .continuing_subword_prefix("##".to_string())
             .build()
             .unwrap();
-        let tokenized = test_trie.match_loop("abcde", 0);
-
-        println!("{:#?}", tokenized);
-        println!("{:#?}", test_trie.nodes);
+        let tokenized = test_trie.tokenize("abcdz").unwrap();
+        let tokenized_value = tokenized.iter().map(|x| x.value.clone()).collect::<Vec<String>>();
+        assert_eq!(tokenized_value, vec!["a", "##b", "##c", "##dz"])
     }
 }

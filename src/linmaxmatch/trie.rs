@@ -73,12 +73,6 @@ impl Trie{
                 }
             );
         }
-        //// Add suffix token value
-        // initial_nodes.last_mut().unwrap().vocab_id = Some(
-        //     wordpiece.token_to_id(&suffix_symbol).expect(
-        //         format!("Suffix token {suffix_symbol} not found in wordpiece vocab").as_str()
-        //     )
-        // );
         let mut out = Trie{
             nodes: initial_nodes,
             wordpiece: wordpiece,
@@ -159,8 +153,8 @@ impl Trie{
         }
         return curr_node.vocab_id.is_some()
     }
-
-    pub fn precompute(&mut self){
+    
+    fn precompute(&mut self){
         // Algorithm 2 of https://aclanthology.org/2021.emnlp-main.160.pdf
         let mut queue: VecDeque<NodeID> = VecDeque::new();
         for i in 0..self.suffix_id+1{
@@ -255,6 +249,7 @@ pub mod test_trie{
         vocab.insert("##c".to_string(), 3);
         vocab.insert("##cdy".to_string(), 4);
         vocab.insert("##dz".to_string(), 5);
+        vocab.insert("[UNK]".to_string(), 6);
         let wordpeice_builder: WordPieceBuilder = WordPieceBuilder::new()
         .vocab(vocab)
         .unk_token("[UNK]".to_string())
@@ -301,7 +296,6 @@ pub mod test_trie{
     pub fn test_match_loop(){
         let wordpiece =  get_example1_wordpiece();
         let mut test_trie = Trie::from_wordpiece(wordpiece);
-        test_trie.precompute();
         let (tokens, u_id, i) = test_trie.match_loop("abcdz", 0);
         let expected_tokens: Vec<usize> = vec![3, 8, 9, 13];
         assert_eq!(tokens, expected_tokens);
