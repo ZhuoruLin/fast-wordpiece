@@ -1,5 +1,9 @@
-use std::collections::{HashMap, VecDeque};
-use tokenizers::{models::wordpiece::WordPiece, Model};
+use tokenizers::{models::wordpiece::WordPiece, Model, Result, Token};
+use std::collections::{HashMap, HashSet, VecDeque};
+use tokenizers::models::wordpiece::WordPieceBuilder;
+use tokenizers::models::wordpiece::WordPieceTrainer;
+use tokenizers::models::wordpiece::Error;
+
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum NodeValue{
@@ -10,7 +14,7 @@ enum NodeValue{
 type NodeID = usize;
 
 #[derive(Debug, Clone)]
-pub struct TrieNode{
+struct TrieNode{
     id: usize,
     val: NodeValue,
     depth: usize,
@@ -21,6 +25,19 @@ pub struct TrieNode{
 }
 
 impl TrieNode{
+    pub fn new_node(
+        id: usize,
+        val: NodeValue,
+        depth: usize
+    ) -> Self{
+        TrieNode {
+            id: id,
+            val: val,
+            depth: depth,
+            ..Default::default()
+        }
+    }
+
     pub fn get_depth(&self) -> usize{
         self.depth
     }
@@ -28,6 +45,17 @@ impl TrieNode{
     pub fn get_vocab_id(&self) -> Option<&u32>{
         self.vocab_id.as_ref()
     }
+
+    pub fn set_vocab_id(&mut self, vocab_id: u32){
+        self.vocab_id = Some(vocab_id);
+    }
+
+    pub fn add_edge(&mut self, character: char, node_id: NodeID){
+        if !self.edges.contains_key(&character){
+            self.edges.insert(character, node_id);
+        }
+    }
+
 }
 
 impl Default for  TrieNode{
@@ -46,46 +74,30 @@ impl Default for  TrieNode{
 }
 
 #[derive(Debug)]
-pub struct Trie{
-    pub nodes: Vec<TrieNode>,
-    pub wordpiece: WordPiece,
-    suffix_id: usize
+struct Trie{
+    nodes: Vec<TrieNode>,
+    pub(super) wordpiece: WordPiece,
+    pub(super) suffix_id: usize,
+    pub(super) e2e: bool
+}
+
+impl Default for Trie{
+    fn default() -> Self {
+        let default_wordpiece = WordPiece::default();
+        let suffix_len = default_wordpiece.continuing_subword_prefix.chars().count();
+        Trie { 
+            nodes: vec![], 
+            wordpiece: default_wordpiece, 
+            suffix_id: suffix_len,
+            e2e: false
+        }
+    }
 }
 
 impl Trie{
-    pub fn from_wordpiece(wordpiece: WordPiece) -> Self{
-        let suffix_symbol = &wordpiece.continuing_subword_prefix;
-        let mut initial_nodes: Vec<TrieNode> = Vec::new();
-        initial_nodes.push(Default::default());
-        let mut suffix_id:usize = 0; 
-        let mut depth:usize = 0;
-        for c in suffix_symbol.chars(){
-            suffix_id += 1;
-            depth += 1;
-            let prev = initial_nodes.last_mut().unwrap();
-            prev.edges.insert(c, suffix_id);
-            initial_nodes.push(
-                TrieNode{
-                    id: suffix_id,
-                    val: NodeValue::Char(c),
-                    depth: depth,
-                    ..Default::default()
-                }
-            );
-        }
-        let mut out = Trie{
-            nodes: initial_nodes,
-            wordpiece: wordpiece,
-            suffix_id: suffix_id
-        };
-        let mut vocab: Vec<(String, u32)> = out.wordpiece.get_vocab().into_iter().collect();
-        vocab.sort_unstable_by_key(|k| k.1);
-        for (token_value, _) in vocab.iter(){
-            if *token_value == out.wordpiece.unk_token{continue;};
-            out.add_token_value(&token_value);
-        }
-        out.precompute();
-        out
+
+    fn set_e2e(&mut self, e2e: bool){
+        self.e2e = e2e
     }
 
     pub fn get_suffix_id(&self) -> NodeID{
@@ -96,6 +108,10 @@ impl Trie{
         if id < self.nodes.len(){
             Some(&self.nodes[id])
         }else{None}
+    }
+
+    pub fn add_node(&mut self, node:TrieNode){
+        self.nodes.push(node);
     }
 
     pub fn get_node_mut(&mut self, id:usize) -> Option<&mut TrieNode>{
@@ -154,7 +170,7 @@ impl Trie{
         return curr_node.vocab_id.is_some()
     }
     
-    fn precompute(&mut self){
+    pub fn precompute(&mut self){
         // Algorithm 2 of https://aclanthology.org/2021.emnlp-main.160.pdf
         let mut queue: VecDeque<NodeID> = VecDeque::new();
         for i in 0..self.suffix_id+1{
@@ -232,16 +248,235 @@ impl Trie{
 
 }
 
+type Vocab = HashMap<String, u32>;
+
+struct Config {
+    files: Option<String>,
+    vocab: Vocab,
+    unk_token: String,
+    continuing_subword_prefix: String,
+    max_input_chars_per_word: usize,
+    e2e: bool,
+    punctuations: HashSet<char> // Reference: https://github.com/huggingface/tokenizers/blob/main/tokenizers/src/pre_tokenizers/bert.rs#L5
+}
+
+impl Default for Config{
+    fn default() -> Self {
+        Config { 
+            files: None, 
+            vocab: HashMap::new(), 
+            unk_token: "[UNK]".to_string(), 
+            continuing_subword_prefix: "##".to_string(), 
+            max_input_chars_per_word: 100 ,
+            e2e: false,
+            punctuations: ('!'..='/').chain(':'..='@').chain('['..='`').chain('{'..='~').collect::<HashSet<char>>()
+        }
+    }
+}
+
+pub struct TrieBuilder{
+    config: Config
+}
+
+impl TrieBuilder{
+    pub fn new() -> Self{
+        TrieBuilder{
+            config: Config::default()
+        }
+    }
+
+    pub fn e2e(mut self, e2e: bool) -> Self{
+        self.config.e2e = e2e;
+        self
+    }
+    /// Set the input files.
+    #[must_use]
+    pub fn files(mut self, vocab: String) -> Self {
+        self.config.files = Some(vocab);
+        self
+    }
+
+    /// Set the vocab (token -> ID) mapping.
+    #[must_use]
+    pub fn vocab(mut self, vocab: Vocab) -> Self {
+        self.config.vocab = vocab;
+        self
+    }
+
+    /// The the `UNK` token for the vocab.
+    #[must_use]
+    pub fn unk_token(mut self, unk_token: String) -> Self {
+        self.config.unk_token = unk_token;
+        self
+    }
+
+    /// Set the prefix for continuing subwords.
+    #[must_use]
+    pub fn continuing_subword_prefix(mut self, continuing_subword_prefix: String) -> Self {
+        self.config.continuing_subword_prefix = continuing_subword_prefix;
+        self
+    }
+
+    /// Set the maximum number of input characters per word.
+    #[must_use]
+    pub fn max_input_chars_per_word(mut self, max_input_chars_per_word: usize) -> Self {
+        self.config.max_input_chars_per_word = max_input_chars_per_word;
+        self
+    }
+
+    pub fn build(mut self) -> Result<Trie>{
+        // Build Wordpiece Tokenizer
+        let wordpiece = if let Some(vocab) = self.config.files{
+            WordPieceBuilder::new().files(vocab).build().expect("Wordpiece building error")
+        }else{
+            WordPieceBuilder::new()
+            .vocab(self.config.vocab)
+            .continuing_subword_prefix(self.config.continuing_subword_prefix)
+            .unk_token(self.config.unk_token)
+            .max_input_chars_per_word(self.config.max_input_chars_per_word)
+            .build().expect("Wordpiece building error")
+            
+        };
+        let suffix_symbol = &wordpiece.continuing_subword_prefix;
+        let mut initial_nodes: Vec<TrieNode> = Vec::new();
+        initial_nodes.push(Default::default()); // Head Node
+        let mut suffix_id:usize = 0; 
+        let mut depth:usize = 0;
+        // Add suffix node
+        for c in suffix_symbol.chars(){
+            suffix_id += 1;
+            depth += 1;
+            let prev = initial_nodes.last_mut().unwrap();
+            prev.add_edge(c, suffix_id);
+            initial_nodes.push(
+                TrieNode::new_node(suffix_id, NodeValue::Char(c), depth)
+            );
+        }
+        if self.config.e2e{
+            // Add punctuation node
+            for punc_char in self.config.punctuations{
+                let punc_node_id = initial_nodes.len();
+                let mut punc_node = TrieNode::new_node(punc_node_id, NodeValue::Char(punc_char), 1);
+                // Add edges between head node and punc char
+                initial_nodes[0].add_edge(punc_char, punc_node_id);
+                // Determine node value
+                if let Some(vocab_id) = wordpiece.token_to_id(&punc_char.to_string()){
+                    punc_node.set_vocab_id(vocab_id);
+                }
+                initial_nodes.push(punc_node);
+            }
+        }
+        let mut trie = Trie{
+            nodes: initial_nodes,
+            wordpiece: wordpiece,
+            suffix_id: suffix_id,
+            e2e: self.config.e2e,
+            ..Default::default()
+        };
+        // Add vocab 
+        let vocab = trie.get_vocab();
+        let mut pairs: Vec<(String, u32)> = vocab.into_iter().collect();
+        pairs.sort_by_cached_key(|x| x.1);
+        for (token_value, token_id) in pairs{
+            if token_value == trie.wordpiece.unk_token{
+                continue
+            }
+            trie.add_token_value(&token_value)
+        }
+        trie.precompute();
+        println!("{trie:#?}");
+        Ok(trie)
+    }
+}
+
+impl Model for Trie{
+    // Only changing the tokenize method. Let wordpiece handle the rest
+    type Trainer = WordPieceTrainer;
+
+    fn get_vocab(&self) -> HashMap<String, u32> {
+        self.wordpiece.get_vocab()
+    }
+
+    fn get_vocab_size(&self) -> usize {
+        self.wordpiece.get_vocab_size()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.wordpiece.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.wordpiece.id_to_token(id)
+    }
+
+    fn save(&self, folder: &std::path::Path, prefix: Option<&str>) -> Result<Vec<std::path::PathBuf>> {
+        self.wordpiece.save(folder, prefix)
+    }
+
+    fn get_trainer(&self) -> <Self as Model>::Trainer {
+        self.wordpiece.get_trainer()
+    }
+
+    fn tokenize(&self, sequence: &str) -> Result<Vec<Token>> {
+        // Same logic as wordpiece
+        let char_len = sequence.chars().count();
+        if char_len > self.wordpiece.max_input_chars_per_word {
+            return Ok(vec![Token {
+                value: self.wordpiece.unk_token.clone(),
+                id: self
+                .wordpiece
+                .token_to_id(&self.wordpiece.unk_token)
+                .ok_or(Error::MissingUnkToken)?,
+                offsets: (0, sequence.len()),
+            }]);
+        }
+        // For exact match case
+        if let Some(vocab_id) = self.wordpiece.token_to_id(sequence){
+            return Ok(vec![
+                Token{
+                    id: vocab_id,
+                    value: sequence.to_string(),
+                    offsets: (0, char_len)
+                }
+            ])
+        }
+        // Algorithm 1
+        let (token_node_ids, u, i) = self.match_loop(sequence, 0);
+        if (i < char_len) | (u!=self.get_suffix_id()){
+            return Ok(vec![Token {
+                value: self.wordpiece.unk_token.clone(),
+                id: self
+                .wordpiece
+                .token_to_id(&self.wordpiece.unk_token)
+                .ok_or(Error::MissingUnkToken)?,
+                offsets: (0, sequence.len()),
+            }]);
+        }
+        let mut output_vec: Vec<Token> = Vec::with_capacity(token_node_ids.len());
+        let mut char_start: usize = 0;
+        for (i, id) in token_node_ids.iter().enumerate(){
+            let trie_node = self.get_node(*id).expect(format!("Trie node: {id} not founded").as_str());
+            let vocab_id = trie_node.get_vocab_id().expect("Trie node doesn't contain token value");
+            let token_length = if i == 0{trie_node.get_depth()}else{trie_node.get_depth() - self.get_suffix_id()};
+            let token = Token{
+                id: *vocab_id,
+                value: self.wordpiece.id_to_token(*vocab_id).unwrap(),
+                offsets: (char_start, char_start + token_length)
+            };
+            char_start += token_length;
+            output_vec.push(token);
+        }
+        Ok(output_vec)
+    }
+}
+
 
 
 #[cfg(test)]
 pub mod test_trie{
-    use tokenizers::models::wordpiece::WordPieceBuilder;
-
     use super::*;
 
-    fn get_example1_wordpiece() -> WordPiece{
-        // Example 1 from https://aclanthology.org/2021.emnlp-main.160.pdf
+    fn get_example1_vocab() -> Vocab{
         let mut vocab: HashMap<String, u32> = HashMap::new();
         vocab.insert("a".to_string(), 0);
         vocab.insert("abcdx".to_string(), 1);
@@ -250,25 +485,23 @@ pub mod test_trie{
         vocab.insert("##cdy".to_string(), 4);
         vocab.insert("##dz".to_string(), 5);
         vocab.insert("[UNK]".to_string(), 6);
-        let wordpeice_builder: WordPieceBuilder = WordPieceBuilder::new()
-        .vocab(vocab)
-        .unk_token("[UNK]".to_string())
-        .continuing_subword_prefix("##".to_string())
-        .max_input_chars_per_word(100);
-        wordpeice_builder.build().expect("Test Wordpiece build unsucessful")
+        vocab
     }
 
-    #[test]
-    fn test_from_wordpiece(){
-        let wordpiece = get_example1_wordpiece();
-        let test_trie = Trie::from_wordpiece(wordpiece);
-        assert_eq!(test_trie.suffix_id, 2);
-    }
+    fn get_example1_trie() -> Trie{
+        // Example 1 from https://aclanthology.org/2021.emnlp-main.160.pdf
+        let mut vocab = get_example1_vocab();
+        TrieBuilder::new()
+        .vocab(vocab)
+        .e2e(false)
+        .continuing_subword_prefix("##".to_string())
+        .unk_token("[UNK]".to_string())
+        .build().unwrap()
+        }
 
     #[test]
     pub fn test_precompute(){
-        let wordpiece =  get_example1_wordpiece();
-        let test_trie = Trie::from_wordpiece(wordpiece);
+        let test_trie =  get_example1_trie();
         let predicted_failure_link: Vec<Option<usize>> = test_trie.nodes.iter().map(|node| node.failure_link).collect();
         let expected_failure_link: Vec<Option<usize>> =  vec![None, None, None, Some(2), Some(8), Some(9), Some(10), Some(2), Some(2), Some(2), Some(12), Some(2), None, Some(2)];
         assert_eq!(predicted_failure_link, expected_failure_link);
@@ -294,15 +527,26 @@ pub mod test_trie{
     
     #[test]
     pub fn test_match_loop(){
-        let wordpiece =  get_example1_wordpiece();
-        let mut test_trie = Trie::from_wordpiece(wordpiece);
+        let test_trie = get_example1_trie();
         let (tokens, u_id, i) = test_trie.match_loop("abcdz", 0);
         let expected_tokens: Vec<usize> = vec![3, 8, 9, 13];
         assert_eq!(tokens, expected_tokens);
         assert_eq!(u_id, 2);
         assert_eq!(i, 5);
     }
+
+    #[test]
+    pub fn test_punctuation_nodes(){
+        let test_vocab = get_example1_vocab();
+        let trie_builder = TrieBuilder::new()
+        .vocab(test_vocab)
+        .e2e(true)
+        .continuing_subword_prefix("##".to_string())
+        .unk_token("[UNK]".to_string());
+        let puncs: Vec<char> = trie_builder.config.punctuations.iter().copied().collect();
+        let trie = trie_builder.build().unwrap();
+        let head = trie.get_node(0).unwrap();
+        let n_punc_connected_to_head = puncs.iter().map(|x| head.edges.contains_key(x) as usize).sum::<usize>();
+        assert_eq!(n_punc_connected_to_head, puncs.len())
+    }
 }
-
-
-
