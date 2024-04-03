@@ -1,17 +1,27 @@
+use tokenizers::pre_tokenizers::punctuation;
+use tokenizers::utils;
 use tokenizers::{models::wordpiece::WordPiece, Model, Result, Token};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::iter::Peekable;
+use std::result;
 use tokenizers::models::wordpiece::WordPieceBuilder;
 use tokenizers::models::wordpiece::WordPieceTrainer;
 use tokenizers::models::wordpiece::Error;
+
+use crate::linmaxmatch;
+
+use super::utils::{is_space, is_word_boundary};
 
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum NodeValue{
     Head,
+    PuncFailurePop,
     Char(char)
 }
 
 type NodeID = usize;
+type VocabID = u32;
 
 #[derive(Debug, Clone)]
 struct TrieNode{
@@ -19,7 +29,7 @@ struct TrieNode{
     val: NodeValue,
     depth: usize,
     edges: HashMap<char, NodeID>, 
-    vocab_id: Option<u32>,
+    vocab_id: Option<VocabID>,
     failure_link: Option<NodeID>,
     failure_pops: Vec<NodeID>
 }
@@ -56,6 +66,14 @@ impl TrieNode{
         }
     }
 
+    pub fn is_head(&self) -> bool{
+        self.val == NodeValue::Head
+    }
+
+    pub fn is_rp(&self) -> bool{
+        self.val == NodeValue::PuncFailurePop
+    }
+
 }
 
 impl Default for  TrieNode{
@@ -74,7 +92,7 @@ impl Default for  TrieNode{
 }
 
 #[derive(Debug)]
-struct Trie{
+pub(crate) struct Trie{
     nodes: Vec<TrieNode>,
     pub(super) wordpiece: WordPiece,
     pub(super) suffix_id: usize,
@@ -225,16 +243,19 @@ impl Trie{
         }
     }
 
-    pub fn match_loop(&self, sequence: &str, i: usize) -> (Vec<NodeID>, NodeID, usize){
-        // Algorithm 1 from https://aclanthology.org/2021.emnlp-main.160.pdf
-        let w_ = sequence.chars().chain(" ".chars());
+    pub fn match_loop(&self, s: &mut impl Iterator<Item = char>) -> (Vec<NodeID>, NodeID, Option<char>, usize){
+        // Adapt from Algorithm 1 from https://aclanthology.org/2021.emnlp-main.160.pdf
+        // Return tokens, current process node and last token
+
         let mut u = self.get_node(0).expect("Head node does not exist in current Trie!");
         let mut tokens: Vec<NodeID> = Vec::new();
-        let s = w_.skip(i);
-        for (j, c) in s.enumerate(){
+        let mut n: usize = 0;
+
+        while let Some(c) = s.next(){
+            n += 1;
             while !u.edges.contains_key(&c){
                 if let None = u.failure_link{
-                    return (tokens, u.id, j + i)
+                    return (tokens, u.id, Some(c), n)
                 }
                 tokens.extend(u.failure_pops.iter().copied());
                 u = self.get_node(u.failure_link.unwrap()).expect(format!("Failure link {} does not exist in current Trie", u.failure_link.unwrap()).as_str())
@@ -242,8 +263,56 @@ impl Trie{
             u = self.get_node(*u.edges.get(&c).expect(
                 format!("No edges connecting Node {} to character {}", u.id, c).as_str()
             )).expect("Node not found");
+           
         }
-        (tokens, u.id, sequence.chars().count()) 
+        (tokens, u.id, None, n) 
+    }
+
+    pub fn e2e_tokenization(&self, text: &str) -> Result<Vec<Token>>{
+        let mut result: Vec<Token> = Vec::new();
+        let mut s = text.chars().chain(vec![' ']).peekable();
+        let mut token_start:usize = 0;
+        while s.peek().is_some(){
+            let (token_node_ids, u_id, last_c, n) = self.match_loop(&mut s);
+            let u  = self.get_node(u_id).expect(format!("Node not found for u_id {u_id}").as_str());
+            let mut tokens: Vec<Token> = Vec::with_capacity(token_node_ids.len());
+            if !is_word_boundary(last_c.as_ref()) |  (!u.is_rp() & !u.is_head() & (u_id!= self.get_suffix_id())) {
+                let unk_token = Token {
+                    value: self.wordpiece.unk_token.clone(),
+                    id: self
+                    .token_to_id(&self.wordpiece.unk_token)
+                    .ok_or(Error::MissingUnkToken)?,
+                    offsets: (token_start, token_start + n)
+                };
+                tokens.push(unk_token);
+            }
+            else{
+                for token_node_id in token_node_ids{
+                    let vocab_id = self
+                    .get_node(token_node_id)
+                    .unwrap()
+                    .get_vocab_id()
+                    .unwrap()
+                    .clone();
+                    let token = Token{
+                        id: vocab_id.clone(),
+                        value: self
+                        .id_to_token(vocab_id)
+                        .unwrap(),
+                        offsets: (token_start, token_start + n)
+                    };
+                    tokens.push(token)
+                }
+            }
+            result.extend(tokens);
+            token_start = n;
+            // Move pass the boundary
+            while is_word_boundary(s.peek()){
+                s.next();
+            }
+            
+        }
+        Ok(result)
     }
 
 }
@@ -354,6 +423,9 @@ impl TrieBuilder{
         }
         if self.config.e2e{
             // Add punctuation node
+            let rp_id = initial_nodes.len();
+            let rp = TrieNode::new_node(rp_id, NodeValue::PuncFailurePop, 0);
+            initial_nodes.push(rp);
             for punc_char in self.config.punctuations{
                 let punc_node_id = initial_nodes.len();
                 let mut punc_node = TrieNode::new_node(punc_node_id, NodeValue::Char(punc_char), 1);
@@ -363,6 +435,8 @@ impl TrieBuilder{
                 if let Some(vocab_id) = wordpiece.token_to_id(&punc_char.to_string()){
                     punc_node.set_vocab_id(vocab_id);
                 }
+                // Set failure pop
+                punc_node.failure_link = Some(rp_id);
                 initial_nodes.push(punc_node);
             }
         }
@@ -384,7 +458,6 @@ impl TrieBuilder{
             trie.add_token_value(&token_value)
         }
         trie.precompute();
-        println!("{trie:#?}");
         Ok(trie)
     }
 }
@@ -441,8 +514,9 @@ impl Model for Trie{
             ])
         }
         // Algorithm 1
-        let (token_node_ids, u, i) = self.match_loop(sequence, 0);
-        if (i < char_len) | (u!=self.get_suffix_id()){
+        let mut chars_iterator = sequence.chars().chain(vec![' ']).peekable();
+        let (token_node_ids, u, last, n) = self.match_loop(&mut chars_iterator);
+        if chars_iterator.peek().is_some() | (u!=self.get_suffix_id()){
             return Ok(vec![Token {
                 value: self.wordpiece.unk_token.clone(),
                 id: self
@@ -469,6 +543,8 @@ impl Model for Trie{
         Ok(output_vec)
     }
 }
+
+
 
 
 
@@ -528,11 +604,60 @@ pub mod test_trie{
     #[test]
     pub fn test_match_loop(){
         let test_trie = get_example1_trie();
-        let (tokens, u_id, i) = test_trie.match_loop("abcdz", 0);
+        let mut test_input = "abcdz ".chars();
+        let (tokens, u_id, last, _) = test_trie.match_loop(&mut test_input);
         let expected_tokens: Vec<usize> = vec![3, 8, 9, 13];
         assert_eq!(tokens, expected_tokens);
-        assert_eq!(u_id, 2);
-        assert_eq!(i, 5);
+        assert_eq!(u_id, test_trie.get_suffix_id());
+        assert_eq!(Some(' '), last); // Test consume all characters
+        // Failrue Case 1: Fail before consume the entire char iterator
+        let mut fail_input = "abcz ".chars();
+        let (tokens, u_id, last, _) = test_trie.match_loop(&mut fail_input);
+        assert_eq!(Some('z'), last); // Shoudl fail at z
+        // Failure case 2: Fail at last character, should consume the entire char iterator but u_id doesn't point to 
+        let mut fail_input2 = "abcd ".chars();
+        let (tokens, u_id, last, _) = test_trie.match_loop(&mut fail_input2);
+        assert_eq!(Some(' '), last);
+        assert_ne!(test_trie.get_suffix_id(), u_id);
+    }
+
+    #[test]
+    pub fn test_match_loop_punc() -> Result<()>{
+        let mut test_vocab = get_example1_vocab();
+        // Addition of punc vocab
+        test_vocab.insert(','.to_string(), test_vocab.len() as u32);
+
+        // Build with e2e
+        let test_trie = TrieBuilder::new()
+            .e2e(true)
+            .vocab(test_vocab)
+            .continuing_subword_prefix("##".to_string())
+            .unk_token("[UNK]".to_string())
+            .max_input_chars_per_word(10000)
+            .build()?;
+        let mut test_input = "abc, ".chars();
+        let (t, u, lc, n) = test_trie.match_loop(&mut test_input);
+        println!("{t:?}, {u:?}, {lc:?}, {n:?}");
+        let mut test_puct_input = ", ".chars();
+        let (t, _, _, _) = test_trie.match_loop(&mut test_puct_input);
+        println!("{t:?}");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_e2e_tokenize() -> Result<()>{
+        let test_vocab = get_example1_vocab();
+        let test_trie = TrieBuilder::new()
+            .e2e(true)
+            .vocab(test_vocab)
+            .continuing_subword_prefix("##".to_string())
+            .unk_token("[UNK]".to_string())
+            .max_input_chars_per_word(10000)
+            .build()?;
+        let test_input = "abc, abcdx.";
+        let out = test_trie.e2e_tokenization(test_input)?;
+        println!("{out:#?}");
+        Ok(())
     }
 
     #[test]
@@ -546,7 +671,9 @@ pub mod test_trie{
         let puncs: Vec<char> = trie_builder.config.punctuations.iter().copied().collect();
         let trie = trie_builder.build().unwrap();
         let head = trie.get_node(0).unwrap();
+        // Check all punctuations are connected to head node
         let n_punc_connected_to_head = puncs.iter().map(|x| head.edges.contains_key(x) as usize).sum::<usize>();
-        assert_eq!(n_punc_connected_to_head, puncs.len())
+        assert_eq!(n_punc_connected_to_head, puncs.len());
+        // Check all punctuations doesn't conect to anything
     }
 }
